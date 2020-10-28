@@ -993,7 +993,8 @@ public class CoreContainer {
     }
   }
 
-  private static ShutdownPreventer shutdownPreventer = new ShutdownPreventer();
+  // Should only be one per Solr instance, right?
+  private ShutdownPreventer shutdownPreventer = new ShutdownPreventer();
 
   public boolean acquireShutdownPreventer() {
     synchronized (shutdownPreventer) {
