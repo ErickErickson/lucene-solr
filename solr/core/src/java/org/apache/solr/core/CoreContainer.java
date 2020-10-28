@@ -970,10 +970,10 @@ public class CoreContainer {
   private void warnUsersOfInsecureSettings() {
     if (authenticationPlugin == null || authorizationPlugin == null) {
       log.warn("Not all security plugins configured!  authentication={} authorization={}.  Solr is only as secure as " +
-          "you make it. Consider configuring authentication/authorization before exposing Solr to users internal or " +
-          "external.  See https://s.apache.org/solrsecurity for more info",
-            (authenticationPlugin != null) ? "enabled" : "disabled",
-            (authorizationPlugin != null) ? "enabled" : "disabled");
+              "you make it. Consider configuring authentication/authorization before exposing Solr to users internal or " +
+              "external.  See https://s.apache.org/solrsecurity for more info",
+          (authenticationPlugin != null) ? "enabled" : "disabled",
+          (authorizationPlugin != null) ? "enabled" : "disabled");
     }
 
     if (authenticationPlugin != null && StringUtils.isEmpty(System.getProperty("solr.jetty.https.port"))) {
@@ -993,10 +993,33 @@ public class CoreContainer {
     }
   }
 
-  private volatile boolean isShutDown = false;
+  private static ShutdownPreventer shutdownPreventer = new ShutdownPreventer();
+
+  public boolean acquireShutdownPreventer() {
+    synchronized (shutdownPreventer) {
+      return shutdownPreventer.acquire() != null;
+    }
+  }
+
+  public void releaseShutdownPreventer() {
+    synchronized (shutdownPreventer) {
+      shutdownPreventer.release();
+    }
+  }
+
+  // See the comments at the top of ShutdownPreventer class in this file.
+
+  //nocommit bring this back.
+//  public boolean isShuttingDown() {
+//    synchronized (shutdownPreventer) {
+//      return shutdownPreventer.isShutdownPending();
+//    }
+//  }
 
   public boolean isShutDown() {
-    return isShutDown;
+    synchronized (shutdownPreventer) {
+      return shutdownPreventer.isShutdownPending();
+    }
   }
 
   public void shutdown() {
@@ -1013,7 +1036,20 @@ public class CoreContainer {
     ExecutorUtil.shutdownAndAwaitTermination(coreContainerAsyncTaskExecutor);
     ExecutorService customThreadPool = ExecutorUtil.newMDCAwareCachedThreadPool(new SolrNamedThreadFactory("closeThreadPool"));
 
-    isShutDown = true;
+    boolean preventer;
+    synchronized (shutdownPreventer) {
+      preventer = shutdownPreventer.acquireForShutdown();
+    }
+    if (preventer == false) {
+      try {
+        log.error("EOE nocommit shutdown waiting");
+        shutdownPreventer.wait();
+      } catch (InterruptedException e) {
+        ; // do nothing, try to continue shutting down gracefully.
+      }
+      log.error("EOE nocommit shutdown came off wait");
+    }
+    log.error("EOE nocommit shutting down");
     try {
       if (isZooKeeperAware()) {
         cancelCoreRecoveries();
@@ -1202,34 +1238,39 @@ public class CoreContainer {
       throw new RuntimeException("Can not register a null core.");
     }
 
-    if (isShutDown) {
-      core.close();
-      throw new IllegalStateException("This CoreContainer has been closed");
-    }
-
-    assert core.getName().equals(cd.getName()) : "core name " + core.getName() + " != cd " + cd.getName();
-
-    SolrCore old = solrCores.putCore(cd, core);
-
-    coreInitFailures.remove(cd.getName());
-
-    if (old == null || old == core) {
-      if (log.isDebugEnabled()) {
-        log.debug("registering core: {}", cd.getName());
+    boolean shutdownPreventer = acquireShutdownPreventer();
+    try {
+      if (shutdownPreventer == false) {
+        core.close();
+        throw new IllegalStateException("This CoreContainer has been closed");
       }
-      if (registerInZk) {
-        zkSys.registerInZk(core, false, skipRecovery);
+
+      assert core.getName().equals(cd.getName()) : "core name " + core.getName() + " != cd " + cd.getName();
+
+      SolrCore old = solrCores.putCore(cd, core);
+
+      coreInitFailures.remove(cd.getName());
+
+      if (old == null || old == core) {
+        if (log.isDebugEnabled()) {
+          log.debug("registering core: {}", cd.getName());
+        }
+        if (registerInZk) {
+          zkSys.registerInZk(core, false, skipRecovery);
+        }
+        return null;
+      } else {
+        if (log.isDebugEnabled()) {
+          log.debug("replacing core: {}", cd.getName());
+        }
+        old.close();
+        if (registerInZk) {
+          zkSys.registerInZk(core, false, skipRecovery);
+        }
+        return old;
       }
-      return null;
-    } else {
-      if (log.isDebugEnabled()) {
-        log.debug("replacing core: {}", cd.getName());
-      }
-      old.close();
-      if (registerInZk) {
-        zkSys.registerInZk(core, false, skipRecovery);
-      }
-      return old;
+    } finally {
+      if (shutdownPreventer) releaseShutdownPreventer();
     }
   }
 
@@ -1380,12 +1421,13 @@ public class CoreContainer {
   @SuppressWarnings("resource")
   private SolrCore createFromDescriptor(CoreDescriptor dcore, boolean publishState, boolean newCollection) {
 
-    if (isShutDown) {
-      throw new SolrException(ErrorCode.SERVICE_UNAVAILABLE, "Solr has been shutdown.");
-    }
-
+    boolean shutdownPreventer = acquireShutdownPreventer();
     SolrCore core = null;
     try {
+      if (shutdownPreventer == false) {
+        throw new SolrException(ErrorCode.SERVICE_UNAVAILABLE, "Solr has been shutdown.");
+      }
+
       MDCLoggingContext.setCoreDescriptor(this, dcore);
       SolrIdentifierValidator.validateCoreName(dcore.getName());
       if (zkSys.getZkController() != null) {
@@ -1431,6 +1473,7 @@ public class CoreContainer {
         IOUtils.closeQuietly(core);
       throw t;
     } finally {
+      if (shutdownPreventer) releaseShutdownPreventer();
       MDCLoggingContext.clear();
     }
   }
@@ -1632,94 +1675,98 @@ public class CoreContainer {
    *               core has a different id, this is a no-op
    */
   public void reload(String name, UUID coreId) {
-    if (isShutDown) {
-      throw new AlreadyClosedException();
-    }
-    SolrCore newCore = null;
-    SolrCore core = solrCores.getCoreFromAnyList(name, false, coreId);
-    if (core != null) {
-      // The underlying core properties files may have changed, we don't really know. So we have a (perhaps) stale
-      // CoreDescriptor and we need to reload it from the disk files
-      CoreDescriptor cd = reloadCoreDescriptor(core.getCoreDescriptor());
-      solrCores.addCoreDescriptor(cd);
-      Closeable oldCore = null;
-      boolean success = false;
-      try {
-        solrCores.waitAddPendingCoreOps(cd.getName());
-        ConfigSet coreConfig = coreConfigService.loadConfigSet(cd);
-        if (log.isInfoEnabled()) {
-          log.info("Reloading SolrCore '{}' using configuration from {}", cd.getName(), coreConfig.getName());
-        }
-        newCore = core.reload(coreConfig);
-
-        DocCollection docCollection = null;
-        if (getZkController() != null) {
-          docCollection = getZkController().getClusterState().getCollection(cd.getCollectionName());
-          // turn off indexing now, before the new core is registered
-          if (docCollection.getBool(ZkStateReader.READ_ONLY, false)) {
-            newCore.readOnly = true;
-          }
-        }
-
-        registerCore(cd, newCore, false, false);
-
-        // force commit on old core if the new one is readOnly and prevent any new updates
-        if (newCore.readOnly) {
-          RefCounted<IndexWriter> iwRef = core.getSolrCoreState().getIndexWriter(null);
-          if (iwRef != null) {
-            IndexWriter iw = iwRef.get();
-            // switch old core to readOnly
-            core.readOnly = true;
-            try {
-              if (iw != null) {
-                iw.commit();
-              }
-            } finally {
-              iwRef.decref();
-            }
-          }
-        }
-
-
-        if (docCollection != null) {
-          Replica replica = docCollection.getReplica(cd.getCloudDescriptor().getCoreNodeName());
-          assert replica != null;
-          if (replica.getType() == Replica.Type.TLOG) { // TODO: needed here?
-            getZkController().stopReplicationFromLeader(core.getName());
-            if (!cd.getCloudDescriptor().isLeader()) {
-              getZkController().startReplicationFromLeader(newCore.getName(), true);
-            }
-
-          } else if (replica.getType() == Replica.Type.PULL) {
-            getZkController().stopReplicationFromLeader(core.getName());
-            getZkController().startReplicationFromLeader(newCore.getName(), false);
-          }
-        }
-        success = true;
-      } catch (SolrCoreState.CoreIsClosedException e) {
-        throw e;
-      } catch (Exception e) {
-        coreInitFailures.put(cd.getName(), new CoreLoadFailure(cd, e));
-        throw new SolrException(ErrorCode.SERVER_ERROR, "Unable to reload core [" + cd.getName() + "]", e);
-      } finally {
-        if (!success && newCore != null && newCore.getOpenCount() > 0) {
-          IOUtils.closeQuietly(newCore);
-        }
-        solrCores.removeFromPendingOps(cd.getName());
+    boolean shutdownPreventer = acquireShutdownPreventer();
+    try {
+      if (shutdownPreventer == false) {
+        throw new AlreadyClosedException();
       }
-    } else {
-      if(coreId != null) return;// yeah, this core is already reloaded/unloaded return right away
-      CoreLoadFailure clf = coreInitFailures.get(name);
-      if (clf != null) {
+      SolrCore newCore = null;
+      SolrCore core = solrCores.getCoreFromAnyList(name, false, coreId);
+      if (core != null) {
+        // The underlying core properties files may have changed, we don't really know. So we have a (perhaps) stale
+        // CoreDescriptor and we need to reload it from the disk files
+        CoreDescriptor cd = reloadCoreDescriptor(core.getCoreDescriptor());
+        solrCores.addCoreDescriptor(cd);
+        Closeable oldCore = null;
+        boolean success = false;
         try {
-          solrCores.waitAddPendingCoreOps(clf.cd.getName());
-          createFromDescriptor(clf.cd, true, false);
+          solrCores.waitAddPendingCoreOps(cd.getName());
+          ConfigSet coreConfig = coreConfigService.loadConfigSet(cd);
+          if (log.isInfoEnabled()) {
+            log.info("Reloading SolrCore '{}' using configuration from {}", cd.getName(), coreConfig.getName());
+          }
+          newCore = core.reload(coreConfig);
+
+          DocCollection docCollection = null;
+          if (getZkController() != null) {
+            docCollection = getZkController().getClusterState().getCollection(cd.getCollectionName());
+            // turn off indexing now, before the new core is registered
+            if (docCollection.getBool(ZkStateReader.READ_ONLY, false)) {
+              newCore.readOnly = true;
+            }
+          }
+
+          registerCore(cd, newCore, false, false);
+
+          // force commit on old core if the new one is readOnly and prevent any new updates
+          if (newCore.readOnly) {
+            RefCounted<IndexWriter> iwRef = core.getSolrCoreState().getIndexWriter(null);
+            if (iwRef != null) {
+              IndexWriter iw = iwRef.get();
+              // switch old core to readOnly
+              core.readOnly = true;
+              try {
+                if (iw != null) {
+                  iw.commit();
+                }
+              } finally {
+                iwRef.decref();
+              }
+            }
+          }
+
+          if (docCollection != null) {
+            Replica replica = docCollection.getReplica(cd.getCloudDescriptor().getCoreNodeName());
+            assert replica != null;
+            if (replica.getType() == Replica.Type.TLOG) { // TODO: needed here?
+              getZkController().stopReplicationFromLeader(core.getName());
+              if (!cd.getCloudDescriptor().isLeader()) {
+                getZkController().startReplicationFromLeader(newCore.getName(), true);
+              }
+
+            } else if (replica.getType() == Replica.Type.PULL) {
+              getZkController().stopReplicationFromLeader(core.getName());
+              getZkController().startReplicationFromLeader(newCore.getName(), false);
+            }
+          }
+          success = true;
+        } catch (SolrCoreState.CoreIsClosedException e) {
+          throw e;
+        } catch (Exception e) {
+          coreInitFailures.put(cd.getName(), new CoreLoadFailure(cd, e));
+          throw new SolrException(ErrorCode.SERVER_ERROR, "Unable to reload core [" + cd.getName() + "]", e);
         } finally {
-          solrCores.removeFromPendingOps(clf.cd.getName());
+          if (!success && newCore != null && newCore.getOpenCount() > 0) {
+            IOUtils.closeQuietly(newCore);
+          }
+          solrCores.removeFromPendingOps(cd.getName());
         }
       } else {
-        throw new SolrException(SolrException.ErrorCode.BAD_REQUEST, "No such core: " + name);
+        if (coreId != null) return;// yeah, this core is already reloaded/unloaded return right away
+        CoreLoadFailure clf = coreInitFailures.get(name);
+        if (clf != null) {
+          try {
+            solrCores.waitAddPendingCoreOps(clf.cd.getName());
+            createFromDescriptor(clf.cd, true, false);
+          } finally {
+            solrCores.removeFromPendingOps(clf.cd.getName());
+          }
+        } else {
+          throw new SolrException(SolrException.ErrorCode.BAD_REQUEST, "No such core: " + name);
+        }
       }
+    } finally {
+      if (shutdownPreventer) releaseShutdownPreventer();
     }
   }
 
@@ -1727,15 +1774,20 @@ public class CoreContainer {
    * Swaps two SolrCore descriptors.
    */
   public void swap(String n0, String n1) {
-    apiAssumeStandalone();
-    if (n0 == null || n1 == null) {
-      throw new SolrException(SolrException.ErrorCode.BAD_REQUEST, "Can not swap unnamed cores.");
+    boolean shutdownPreventer = acquireShutdownPreventer();
+    try {
+      apiAssumeStandalone();
+      if (n0 == null || n1 == null) {
+        throw new SolrException(SolrException.ErrorCode.BAD_REQUEST, "Can not swap unnamed cores.");
+      }
+      solrCores.swap(n0, n1);
+
+      coresLocator.swap(this, solrCores.getCoreDescriptor(n0), solrCores.getCoreDescriptor(n1));
+
+      log.info("swapped: {} with {}", n0, n1);
+    } finally {
+      if (shutdownPreventer) releaseShutdownPreventer();
     }
-    solrCores.swap(n0, n1);
-
-    coresLocator.swap(this, solrCores.getCoreDescriptor(n0), solrCores.getCoreDescriptor(n1));
-
-    log.info("swapped: {} with {}", n0, n1);
   }
 
   /**
@@ -1871,6 +1923,7 @@ public class CoreContainer {
   public SolrCore getCore(String name) {
     return getCore(name, null);
   }
+
   /**
    * Gets a core by name and increase its refcount.
    *
@@ -1909,9 +1962,11 @@ public class CoreContainer {
     // waitAddPendingCoreOps to createFromDescriptor would introduce a race condition.
     core = solrCores.waitAddPendingCoreOps(name);
 
-    if (isShutDown) return null; // We're quitting, so stop. This needs to be after the wait above since we may come off
+    boolean shutdownPreventer = acquireShutdownPreventer();
+    // We're quitting, so stop. This needs to be after the wait above since we may come off
     // the wait as a consequence of shutting down.
     try {
+      if (shutdownPreventer == false) return null;
       if (core == null) {
         if (zkSys.getZkController() != null) {
           zkSys.getZkController().throwErrorIfReplicaReplaced(desc);
@@ -1920,6 +1975,7 @@ public class CoreContainer {
       }
       core.open();
     } finally {
+      if (shutdownPreventer) releaseShutdownPreventer();
       solrCores.removeFromPendingOps(name);
     }
 
@@ -2156,44 +2212,125 @@ public class CoreContainer {
   public void runAsync(Runnable r) {
     coreContainerAsyncTaskExecutor.submit(r);
   }
-}
-
-class CloserThread extends Thread {
-  CoreContainer container;
-  SolrCores solrCores;
-  NodeConfig cfg;
 
 
-  CloserThread(CoreContainer container, SolrCores solrCores, NodeConfig cfg) {
-    this.container = container;
-    this.solrCores = solrCores;
-    this.cfg = cfg;
+  private static class CloserThread extends Thread {
+    CoreContainer container;
+    SolrCores solrCores;
+    NodeConfig cfg;
+
+
+    CloserThread(CoreContainer container, SolrCores solrCores, NodeConfig cfg) {
+      this.container = container;
+      this.solrCores = solrCores;
+      this.cfg = cfg;
+    }
+
+    // It's important that this be the _only_ thread removing things from pendingDynamicCloses!
+    // This is single-threaded, but I tried a multi-threaded approach and didn't see any performance gains, so
+    // there's no good justification for the complexity. I suspect that the locking on things like DefaultSolrCoreState
+    // essentially create a single-threaded process anyway.
+    @Override
+    public void run() {
+      while (!container.isShutDown()) {
+        synchronized (solrCores.getModifyLock()) { // need this so we can wait and be awoken.
+          try {
+            solrCores.getModifyLock().wait();
+          } catch (InterruptedException e) {
+            // Well, if we've been told to stop, we will. Otherwise, continue on and check to see if there are
+            // any cores to close.
+          }
+        }
+        boolean shutdownPreventer = container.acquireShutdownPreventer();
+        try {
+          for (SolrCore removeMe = solrCores.getCoreToClose();
+               removeMe != null && !container.isShutDown();
+               removeMe = solrCores.getCoreToClose()) {
+            try {
+              removeMe.close();
+            } finally {
+              solrCores.removeFromPendingOps(removeMe.getName());
+            }
+          }
+        } finally {
+          container.releaseShutdownPreventer();
+        }
+      }
+    }
   }
 
-  // It's important that this be the _only_ thread removing things from pendingDynamicCloses!
-  // This is single-threaded, but I tried a multi-threaded approach and didn't see any performance gains, so
-  // there's no good justification for the complexity. I suspect that the locking on things like DefaultSolrCoreState
-  // essentially create a single-threaded process anyway.
-  @Override
-  public void run() {
-    while (!container.isShutDown()) {
-      synchronized (solrCores.getModifyLock()) { // need this so we can wait and be awoken.
-        try {
-          solrCores.getModifyLock().wait();
-        } catch (InterruptedException e) {
-          // Well, if we've been told to stop, we will. Otherwise, continue on and check to see if there are
-          // any cores to close.
-        }
+  // See SOLR-14861. There were race conditions, particularly in tests
+  // where the sequence is:
+  // - Start an operation, reload in this case. There used to be a test at the
+  //   top of that method to see if shutdown had been called, but it was just
+  //   checking a boolean to see if shutdown had _started_. The thread would get
+  //   past that test
+  // - call shutdown in a separate thread
+  // - the reload would get time-sliced out
+  // - shutdown would do some work
+  // - the reloade would pick back up and barf because shutdown has partially
+  //   completed.
+  //
+  // The same is true for other core operations. What we need is a way to make
+  // sure that shutdown does not even start until other operations have finished,
+  // and that other operations do not start once a shutdown has started.
+  //
+  // So the pattern is for "those other operations" to call
+  // CoreContainer.acquireShutdownPreventer first thing and call
+  // CoreContainer.releaseShutdownPreventer after all work is done, preferably
+  // in a try/finally block.
+  //
+  // I considered try-with-resources, but that would expose the
+  // ShutdownPreventer.
+  //
+  // There are still a bunch of places that don't _appear_ to need to lock
+  // for the duration of the operation, so those cases can just test for
+  // whether shutdown has been called by calling CoreContainer.isShuttingDown().
+  //
+  // Basically, anything that does anything with cores where tests are made
+  // for whether shutdown has been initiated need to block shutdown until
+  // the operation is complete.
+  private static class ShutdownPreventer {
+    private int executingCount = 0;
+    private boolean shutdownPending = false;
+
+    // Only allow coreContainer to call this.
+    private ShutdownPreventer acquire() {
+      if (shutdownPending) {
+        log.error("EOE nocommit acquire returning null");
+        return null;
       }
-      for (SolrCore removeMe = solrCores.getCoreToClose();
-           removeMe != null && !container.isShutDown();
-           removeMe = solrCores.getCoreToClose()) {
-        try {
-          removeMe.close();
-        } finally {
-          solrCores.removeFromPendingOps(removeMe.getName());
-        }
+      ++executingCount;
+      log.error("EOE nocommit acquire executingCount = {}", executingCount);
+      return this;
+    }
+
+    private void release() {
+      --executingCount;
+      log.error("EOE nocommit release executingCount = {}", executingCount);
+      if (shutdownPending && executingCount == 0) {
+        log.error("EOE nocommit release, notifying");
+        this.notify(); //
       }
+    }
+
+    private boolean acquireForShutdown() {
+      shutdownPending = true;
+      if (executingCount == 0) {
+        log.error("EOE nocommit acquireForShutdown returning true");
+        return true;
+      }
+      log.error("EOE nocommit acquireForShutdown returning false");
+
+      return false;
+    }
+
+    // This is different than the old isShutdown in that it it will return true
+    // when shutDown has been called. However, other operations that are running
+    // while CoreContainer.shutdown() is waiting to get a lock will complete
+    // before shutdown() does much work.
+    private boolean isShutdownPending() {
+      return shutdownPending;
     }
   }
 }
