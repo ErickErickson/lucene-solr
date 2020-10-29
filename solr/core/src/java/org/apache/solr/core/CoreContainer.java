@@ -2298,19 +2298,22 @@ public class CoreContainer {
     // Only allow coreContainer to call this.
     private ShutdownPreventer acquire() {
       if (shutdownPending) {
-        log.error("EOE nocommit acquire returning null");
+        log.error("EOE nocommit acquire returning null", new Throwable("acquire1"));
         return null;
       }
       ++executingCount;
-      log.error("EOE nocommit acquire executingCount = {}", executingCount);
+      log.error("EOE nocommit acquire executingCount = {}", executingCount, new Throwable("acquire2"));
       return this;
     }
 
     private void release() {
       --executingCount;
-      log.error("EOE nocommit release executingCount = {}", executingCount);
+      if (executingCount < 0) {
+        log.error("EOE nocommit release executingCount = {}", executingCount, new Throwable("release0 impossible!"));
+      }
+      log.error("EOE nocommit release executingCount = {}", executingCount, new Throwable("release1"));
       if (shutdownPending && executingCount == 0) {
-        log.error("EOE nocommit release, notifying");
+        log.error("EOE nocommit release, notifying", new Throwable("release2"));
         this.notify(); //
       }
     }
@@ -2318,10 +2321,10 @@ public class CoreContainer {
     private boolean acquireForShutdown() {
       shutdownPending = true;
       if (executingCount == 0) {
-        log.error("EOE nocommit acquireForShutdown returning true");
+        log.error("EOE nocommit acquireForShutdown returning true", new Throwable("acquireforshutdown2"));
         return true;
       }
-      log.error("EOE nocommit acquireForShutdown returning false");
+      log.error("EOE nocommit acquireForShutdown returning false", new Throwable("acquireforshutdown2"));
 
       return false;
     }
